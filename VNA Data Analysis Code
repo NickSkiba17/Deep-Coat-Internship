@@ -1,0 +1,270 @@
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from IPython.display import display
+from pathlib import Path
+from google.colab import files
+from collections import defaultdict
+
+def load_s2p(filepath):
+    freqs, s21 = [], []
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('!') or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) >= 5:
+                try:
+                    freq = float(parts[0])
+                    real = float(parts[3])
+                    imag = float(parts[4])
+                except ValueError:
+                    continue
+                freqs.append(freq)
+                s21.append(real + 1j*imag)
+    freqs = np.array(freqs)
+    s21 = np.array(s21)
+    mag = np.abs(s21)
+    phase = np.angle(s21)
+    return freqs, mag * np.exp(1j*phase)
+
+def find_closest_index(array, value, tol=1e6):
+    idx = np.abs(array - value).argmin()
+    return idx if abs(array[idx] - value) <= tol else None
+
+def run_vna_analysis_all_groups(baseline_files, shield_files,
+                                target_freqs_mhz=None, out_csv=None):
+
+    def extract_group_label(fp):
+        m = re.search(r'(\d+\.?\d*)(MHz|GHz)', Path(fp).stem, re.IGNORECASE)
+        return m.group(0).lower() if m else None
+
+    def extract_config_key(fp):
+        no_freq = re.sub(r'\s*\d+\.?\d*\s*(MHz|GHz)', '',
+                         Path(fp).stem, flags=re.IGNORECASE)
+        cleaned = re.sub(r'\s+', '', no_freq).lower()
+        return cleaned
+
+    def display_name_from_key(key):
+        parts = re.split(r',', key)
+        return ", ".join(p.strip().capitalize() for p in parts)
+
+    groups = {}
+    for b in baseline_files:
+        lbl = extract_group_label(b)
+        if lbl:
+            groups.setdefault(lbl, {})['baseline'] = b
+    for s in shield_files:
+        lbl = extract_group_label(s)
+        if lbl:
+            groups.setdefault(lbl, {}).setdefault('shields', []).append(s)
+
+    merged = {}
+    config_data = defaultdict(lambda: {'label': '', 'freqs': [], 'se': [], 'att': []})
+    key_to_group = {}
+
+    if target_freqs_mhz:
+        full_hz = np.array(target_freqs_mhz) * 1e6
+        full_mhz = full_hz / 1e6
+    else:
+        full_hz = full_mhz = None
+
+    all_ref_freqs, all_ref_mags = [], []
+    all_sh_freqs,  all_sh_mags  = [], []
+
+    cache = {}
+    for fp in baseline_files + shield_files:
+        cache[fp] = load_s2p(fp)
+
+    for grp, files in groups.items():
+        ref = files.get('baseline')
+        shields = files.get('shields', [])
+        if not ref or not shields:
+            continue
+
+        freqs_ref, s21_ref = cache[ref]
+        mag_ref = np.abs(s21_ref)
+        all_ref_freqs.append(freqs_ref)
+        all_ref_mags.append(mag_ref)
+
+        if full_hz is None:
+            tg_hz = np.linspace(freqs_ref.min(), freqs_ref.max(), 5)
+            tg_mhz = tg_hz / 1e6
+            valid = list(range(len(tg_hz)))
+        else:
+            tg_hz, tg_mhz = full_hz, full_mhz
+            valid = [i for i,f in enumerate(tg_hz)
+                     if freqs_ref.min()-1e6 <= f <= freqs_ref.max()+1e6]
+
+        for s in shields:
+            key = extract_config_key(s)
+            disp = display_name_from_key(key)
+            key_to_group[key] = disp  # use config name as group
+
+            # FIXED LINE HERE: do NOT call dict as function
+            row = merged.setdefault(key, {'Shield': disp})
+
+            config_data[key]['label'] = disp
+
+            freqs_sh, s21_sh = cache[s]
+            mag_sh = np.abs(s21_sh)
+            all_sh_freqs.append(freqs_sh)
+            all_sh_mags.append(mag_sh)
+
+            for i in valid:
+                idx_r = find_closest_index(freqs_ref, tg_hz[i])
+                if idx_r is None:
+                    continue
+                mag_r = mag_ref[idx_r]
+                idx_s = find_closest_index(freqs_sh, freqs_ref[idx_r])
+                mag_s = mag_sh[idx_s] if idx_s is not None else 0
+
+                if mag_r == 0 or mag_s == 0:
+                    se = att = None
+                else:
+                    se  = 20 * np.log10(mag_r / mag_s)
+                    att = (1 - mag_s / mag_r) * 100
+
+                se_col  = f"{tg_mhz[i]:.1f} MHz SE (dB)"
+                att_col = f"{tg_mhz[i]:.1f} MHz Att"
+
+                row[se_col]  = round(se, 2) if se is not None else None
+                row[att_col] = round(att, 3) if att is not None else None
+
+                config_data[key]['freqs'].append(tg_mhz[i])
+                config_data[key]['se'].append(se if se is not None else 0)
+                config_data[key]['att'].append(att if att is not None else 0)
+
+    summary_df = pd.DataFrame(list(merged.values()))
+    freq_pat = re.compile(r"(\d+\.?\d+) MHz")
+    freqs_sorted = sorted({float(m.group(1)) for c in summary_df.columns
+                           if (m := freq_pat.search(c))})
+
+    cols = ["Shield"]
+    for f in freqs_sorted:
+        se_c, att_c = f"{f:.1f} MHz SE (dB)", f"{f:.1f} MHz Att"
+        if se_c in summary_df and summary_df[se_c].notnull().any(): cols.append(se_c)
+        if att_c in summary_df and summary_df[att_c].notnull().any(): cols.append(att_c)
+    summary_df = summary_df[cols].fillna('')
+
+    # Build long-format with groups, drop rows with None
+    long_records = []
+    for _, row in summary_df.iterrows():
+        shield = row['Shield']
+        key = [k for k,v in merged.items() if v['Shield'] == shield][0]
+        group = key_to_group[key]
+        for f in freqs_sorted:
+            se_c = f"{f:.1f} MHz SE (dB)"
+            att_c = f"{f:.1f} MHz Att"
+            se = row.get(se_c)
+            att = row.get(att_c)
+            if se == '' or att == '':
+                continue
+            long_records.append({
+                'Group': group,
+                'Shield': shield,
+                'Frequency (MHz)': f,
+                'SE (dB)': se,
+                'Attenuation (%)': att
+            })
+    long_df = pd.DataFrame(long_records)
+
+    # Sort groups by lowest frequency
+    if not long_df.empty:
+        group_order = long_df.groupby('Group')['Frequency (MHz)'].min().sort_values().index
+        long_df['Group'] = pd.Categorical(long_df['Group'], categories=group_order, ordered=True)
+        long_df = long_df.sort_values(['Group','Frequency (MHz)']).reset_index(drop=True)
+
+    print("\n🔎 Shielding Effectiveness (long format with groups)")
+    display(long_df)
+    if out_csv:
+        long_df.to_csv(out_csv, index=False)
+        print(f"✅ Saved to {out_csv}")
+
+    # Plot SE vs frequency
+    plt.figure(figsize=(8,5))
+    for data in config_data.values():
+        pts = sorted(zip(data['freqs'], data['se']))
+        if not pts: continue
+        x, y = zip(*pts)
+        plt.plot(x, y, marker='o', label=data['label'])
+    plt.xlabel('Frequency (MHz)')
+    plt.ylabel('SE (dB)')
+    plt.title('Shielding Effectiveness vs Frequency')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # Plot Attenuation vs frequency
+    plt.figure(figsize=(8,5))
+    for data in config_data.values():
+        pts = sorted(zip(data['freqs'], data['att']))
+        if not pts: continue
+        x, y = zip(*pts)
+        plt.plot(x, y, marker='x', linestyle='--', label=data['label'])
+    plt.xlabel('Frequency (MHz)')
+    plt.ylabel('Attenuation (%)')
+    plt.title('Attenuation vs Frequency')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # Full-sweep overlay plot
+    plt.figure(figsize=(12,6))
+    for freqs_b, mag_b in zip(all_ref_freqs, all_ref_mags):
+        plt.plot(freqs_b/1e6, mag_b, '--', color='black', alpha=0.5)
+    cmap = plt.get_cmap('tab10')
+    for idx, (key, data) in enumerate(config_data.items()):
+        color = cmap(idx % 10)
+        for s in shield_files:
+            if extract_config_key(s) == key:
+                freqs_s, s21_s = cache[s]
+                plt.plot(freqs_s/1e6, np.abs(s21_s), '-', color=color)
+    all_freqs = np.concatenate(all_ref_freqs + all_sh_freqs)/1e6
+    all_mags  = np.concatenate(all_ref_mags  + all_sh_mags)
+    plt.xlim(all_freqs.min(), all_freqs.max())
+    plt.ylim(all_mags.min(), all_mags.max())
+    plt.xlabel('Frequency (MHz)')
+    plt.ylabel('|S21|')
+    plt.title('Full-sweep |S21| Overlay')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+    return long_df
+
+# — upload & run —
+
+print("▶ Upload baseline (unshielded) .s2p files:")
+baseline_up = files.upload()
+baseline_files = list(baseline_up.keys())
+
+print("\n▶ Upload shielded .s2p files:")
+shield_up = files.upload()
+shield_files = list(shield_up.keys())
+
+freq_input = input("Enter frequencies to analyze in MHz, separated by commas: ")
+try:
+    freq_list = [float(f.strip()) for f in freq_input.split(",") if f.strip()]
+except:
+    print("Invalid frequencies, using default.")
+    freq_list = None
+
+long_df = run_vna_analysis_all_groups(
+    baseline_files,
+    shield_files,
+    target_freqs_mhz=freq_list,
+    out_csv="VNA_DATA.csv"
+)
+
+long_df.to_csv("VNA_DATA.csv", index=False)
+from google.colab import files
+files.download("VNA_DATA.csv")
+
+
+# Example input for prompt: (Copy and paste)
+# 100, 250, 500, 750, 1000, 2400, 3500, 4500, 5800, 6300  (MHz)
+# 1.1, 5, 10, 30, 50, 100, 250, 500, 750, 1000, 1250, 1500, 1750, 2000, 2250, 2400, 2500, 2750, 3000, 3250, 3500, 3750, 4000, 4250, 4500, 4750, 5000, 5250, 5500, 5750, 5800, 6000, 6250, 6300
