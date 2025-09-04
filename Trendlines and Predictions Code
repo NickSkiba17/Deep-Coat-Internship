@@ -1,0 +1,223 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.signal import savgol_filter
+from scipy.interpolate import PchipInterpolator
+from sklearn.isotonic import IsotonicRegression
+from scipy.optimize import curve_fit
+from google.colab import files
+
+# === Upload Excel file ===
+uploaded = files.upload()
+for fname in uploaded:
+    df = pd.read_excel(fname)
+    break
+
+# === Validate expected columns ===
+required = ['Frequency (MHz)', 'SE (dB)', 'Att (%)', 'ShieldGroup']
+missing = [c for c in required if c not in df.columns]
+if missing:
+    raise ValueError(f"Missing columns: {missing}")
+
+# === Preprocess ===
+df['Frequency (MHz)'] = pd.to_numeric(df['Frequency (MHz)'], errors='coerce')
+df['SE (dB)']         = pd.to_numeric(df['SE (dB)'], errors='coerce')
+df['Att (%)']         = pd.to_numeric(df['Att (%)'], errors='coerce')
+df = df.dropna(subset=required)
+
+# === Frequency bands ===
+bands = [
+    (0,    0.1,   '0–100 kHz'),
+    (0,    1.0,   '0–1 MHz'),
+    (0,   30.0,   '0–30 MHz'),
+    (0, 6300.0,   '0–6.3 GHz'),
+]
+
+# Extended band for 0-30 GHz predictions
+extended_band = (0, 30000.0, '0–30 GHz (extended)')
+
+# === Initialize diagnostics DataFrame ===
+diagnostics_df = pd.DataFrame()
+
+# === Helper functions ===
+def smooth_data(y):
+    try:
+        win = min(31, len(y) if len(y)%2 else len(y)-1)
+        win = max(win, 5)
+        return savgol_filter(y, window_length=win, polyorder=3)
+    except:
+        return y
+
+def phys_model(f, a, b, c):
+    return a*np.sqrt(f) + b*np.log(f + 1e-6) + c
+
+def log_poly_predict(x, y, x_new, deg=2):
+    mask = y > 0
+    lx, ly = np.log(x[mask]), np.log(y[mask])
+    p = np.polyfit(lx, ly, deg=deg)
+    return np.exp(np.polyval(p, np.log(x_new)))
+
+def isotonic_predict(x, y, x_new):
+    ir = IsotonicRegression(increasing=True, out_of_bounds='clip')
+    y_iso = ir.fit_transform(x, y)
+    return ir.predict(x_new)
+
+# === Core plotting with diagnostics ===
+def plot_with_multi_models(col, label, fmin, fmax, band, max_freq_override=None):
+    global diagnostics_df
+    plt.figure(figsize=(12,7))
+    colors = plt.cm.tab10.colors
+    for i, (name, g) in enumerate(df.groupby('ShieldGroup')):
+        sub = g[(g['Frequency (MHz)']>=fmin) & (g['Frequency (MHz)']<=fmax)]
+        sub = sub.sort_values('Frequency (MHz)')
+        x = sub['Frequency (MHz)'].values
+        y = sub[col].values
+        if len(x) < 5:
+            continue
+
+        color = colors[i % len(colors)]
+        plt.scatter(x, y, color=color, s=12, alpha=0.6, label=name)
+
+        # Smooth & downsample
+        y_sm = smooth_data(y)
+        ds = max(1, len(x) // (30 if fmax > 1000 else 20))
+        x_ds, y_ds = x[::ds], y_sm[::ds]
+        if col == 'Att (%)':
+            y_ds = np.maximum.accumulate(y_ds)
+
+        # x-axis for predictions
+        x_cur = np.linspace(x.min(), x.max(), 200)
+        x_fut_max = max_freq_override if max_freq_override else x.max() * 1.5
+        x_fut = np.linspace(x.max(), x_fut_max, 100)
+
+        # Prediction lists
+        preds_cur, preds_fut = [], []
+        model_names = []
+
+        # Physics model
+        try:
+            popt, _ = curve_fit(phys_model, x_ds, y_ds, maxfev=5000)
+            preds_cur.append(phys_model(x_cur, *popt))
+            preds_fut.append(phys_model(x_fut, *popt))
+            model_names.append("Physics")
+        except:
+            pass
+
+        # Log-poly
+        try:
+            preds_cur.append(log_poly_predict(x_ds, y_ds, x_cur))
+            preds_fut.append(log_poly_predict(x_ds, y_ds, x_fut))
+            model_names.append("LogPoly")
+        except:
+            pass
+
+        # Isotonic
+        try:
+            preds_cur.append(isotonic_predict(x_ds, y_ds, x_cur))
+            preds_fut.append(isotonic_predict(x_ds, y_ds, x_fut))
+            model_names.append("Isotonic")
+        except:
+            pass
+
+        # Average predictions
+        if preds_cur:
+            y_cur_mean = np.mean(preds_cur, axis=0)
+            y_fut_mean = np.mean(preds_fut, axis=0)
+        else:
+            y_cur_mean = y_sm[:len(x_cur)]
+            y_fut_mean = y_sm[len(x_cur):len(x_cur) + len(x_fut)]
+
+        # Monotonic & capped
+        y_cur_mean = np.maximum.accumulate(y_cur_mean)
+        y_fut_mean = np.maximum.accumulate(y_fut_mean)
+        if col == 'Att (%)':
+            y_cur_mean = np.minimum(y_cur_mean, 100)
+            y_fut_mean = np.minimum(y_fut_mean, 100)
+
+        # === Plot ===
+        plt.plot(x_cur, y_cur_mean, '-', color=color, linewidth=2, alpha=0.9, label=f"{name} trend")
+        plt.plot(
+            np.concatenate([[x_cur[-1]], x_fut]),
+            np.concatenate([[y_cur_mean[-1]], y_fut_mean]),
+            '--', color=color, linewidth=2, alpha=0.9, label=f"{name} prediction"
+        )
+
+        # === Save diagnostics ===
+        all_freqs = np.concatenate([x_cur, x_fut])
+        all_preds = np.concatenate([y_cur_mean, y_fut_mean])
+        n = len(all_freqs)
+        for j in range(n):
+            row = {
+                'ShieldGroup': name,
+                'Band': band,
+                'Frequency (MHz)': all_freqs[j],
+                'FinalPrediction': all_preds[j],
+                'Raw': y[j] if j < len(y) else np.nan,
+                'Smoothed': y_sm[j] if j < len(y_sm) else np.nan,
+                'coltype': col  # This marks SE or Att for filtering later
+            }
+            for k, pred_list in enumerate(preds_cur + preds_fut):
+                if j < len(pred_list):
+                    key = f"{model_names[k % len(model_names)]}_{'cur' if k < len(preds_cur) else 'fut'}"
+                    row[key] = pred_list[j]
+            diagnostics_df = pd.concat([diagnostics_df, pd.DataFrame([row])], ignore_index=True)
+
+    plt.xlabel('Frequency (MHz)')
+    plt.ylabel(label)
+    plt.title(f'{label} Predictions ({band})')
+    plt.grid(True, which='both', ls='--', lw=0.5)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+# === Run plots for all defined bands ===
+for fmin, fmax, band in bands:
+    plot_with_multi_models('SE (dB)', 'SE (dB)', fmin, fmax, band)
+    plot_with_multi_models('Att (%)', 'Attenuation (%)', fmin, fmax, band)
+
+# === Run extra plots for extended 0-30 GHz band predictions ===
+plot_with_multi_models('SE (dB)', 'SE (dB)', extended_band[0], extended_band[1], extended_band[2], max_freq_override=extended_band[1])
+plot_with_multi_models('Att (%)', 'Attenuation (%)', extended_band[0], extended_band[1], extended_band[2], max_freq_override=extended_band[1])
+
+# === Generate and display clean future prediction table ===
+max_freq_input = df['Frequency (MHz)'].max()
+
+future_df = diagnostics_df[
+    (diagnostics_df['Frequency (MHz)'] > max_freq_input) &
+    (diagnostics_df['Band'] == extended_band[2])
+].copy()
+
+# Separate attenuation predictions
+att_df = future_df[future_df['coltype'] == 'Att (%)']
+att_df = att_df[['ShieldGroup', 'Frequency (MHz)', 'FinalPrediction']].copy()
+att_df.rename(columns={'FinalPrediction': 'Attenuation Prediction (Att %)'}, inplace=True)
+att_df = att_df.drop_duplicates(subset=['ShieldGroup', 'Frequency (MHz)'])
+
+# Separate shielding effectiveness predictions
+se_df = future_df[future_df['coltype'] == 'SE (dB)']
+se_df = se_df[['ShieldGroup', 'Frequency (MHz)', 'FinalPrediction']].copy()
+se_df.rename(columns={'FinalPrediction': 'SE Prediction (dB)'}, inplace=True)
+se_df = se_df.drop_duplicates(subset=['ShieldGroup', 'Frequency (MHz)'])
+
+# Merge attenuation and SE on ShieldGroup and Frequency
+merged_df = pd.merge(att_df, se_df, on=['ShieldGroup', 'Frequency (MHz)'], how='inner')
+
+# Optional: reduce number of rows by selecting every 10th frequency for readability
+merged_df = merged_df.iloc[::10].reset_index(drop=True)
+
+# Display the final future prediction table
+pd.set_option('display.max_rows', None)
+display(merged_df)
+from google.colab import files
+import io
+
+# Save merged_df to Excel in memory
+output = io.BytesIO()
+merged_df.to_excel(output, index=False, engine='openpyxl')
+output.seek(0)
+
+# Write to file and trigger download
+with open('future_predictions_extended_band.xlsx', 'wb') as f:
+    f.write(output.read())
+
+files.download('future_predictions_extended_band.xlsx')
