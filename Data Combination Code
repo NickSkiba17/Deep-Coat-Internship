@@ -1,0 +1,194 @@
+import pandas as pd
+from google.colab import files
+from io import StringIO
+import matplotlib.pyplot as plt
+import numpy as np
+
+# === Upload files ===
+uploaded = files.upload()
+
+se_df = None
+scope_df = None
+
+# Detect and load files
+for name in uploaded:
+    lname = name.lower()
+    if 'vna' in lname or 'se' in lname:
+        se_df = pd.read_csv(StringIO(uploaded[name].decode("utf-8")))
+    elif 'oscilloscope' in lname or 'scope' in lname:
+        scope_df = pd.read_csv(StringIO(uploaded[name].decode("utf-8")))
+
+assert se_df is not None, "VNA data file not found!"
+assert scope_df is not None, "Oscilloscope data file not found!"
+
+# Debug prints to confirm load
+print("SE file columns:", se_df.columns.tolist())
+print("Scope file columns:", scope_df.columns.tolist())
+print("SE file sample rows:\n", se_df.head())
+print("Scope file sample rows:\n", scope_df.head())
+
+# === Process SE Data (VNA) ===
+se_processed = se_df.rename(columns={'Attenuation (%)': 'Att (%)'})
+se_processed = se_processed[['Shield', 'Frequency (MHz)', 'SE (dB)', 'Att (%)']]
+
+# === Process Oscilloscope Data ===
+def extract_shield_name(filename):
+    base = filename.split('.')[0]
+    parts = base.split()
+    filtered_parts = [p for p in parts if not any(c.isdigit() for c in p)]
+    if not filtered_parts:
+        return base
+    return ' '.join(filtered_parts)
+
+required_scope_cols = ['Filename', 'Frequency (Hz)', 'SE (dB)', 'Attenuation (%)']
+missing_cols = [c for c in required_scope_cols if c not in scope_df.columns]
+assert not missing_cols, f"Oscilloscope file missing columns: {missing_cols}"
+
+scope_processed = scope_df[required_scope_cols].copy()
+scope_processed['Shield'] = scope_processed['Filename'].apply(extract_shield_name)
+scope_processed['Frequency (MHz)'] = scope_processed['Frequency (Hz)'] / 1_000_000
+scope_processed = scope_processed.rename(columns={'Attenuation (%)': 'Att (%)'})
+scope_processed = scope_processed[['Shield', 'Frequency (MHz)', 'SE (dB)', 'Att (%)']]
+
+# === Combine and clean ===
+combined = pd.concat([se_processed, scope_processed], ignore_index=True)
+combined['ShieldGroup'] = combined['Shield'].str.lower().str.replace(r"\s+", "", regex=True)
+combined = combined.dropna(subset=['SE (dB)', 'Att (%)', 'Frequency (MHz)'])
+
+group_min_freq = combined.groupby('ShieldGroup')['Frequency (MHz)'].transform('min')
+combined = combined.assign(GroupMinFreq=group_min_freq)
+combined = combined.sort_values(['GroupMinFreq', 'ShieldGroup', 'Frequency (MHz)']).reset_index(drop=True)
+combined = combined.drop(columns=['GroupMinFreq'])
+
+# === Display ===
+from IPython.display import display
+print("=== Combined Data Table ===")
+
+# --- ADD pandas display options here ---
+pd.set_option('display.max_rows', None)
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', 0)
+pd.set_option('display.max_colwidth', None)
+
+display(combined)
+
+# === Plotting ===
+plt.figure(figsize=(14,6))
+
+plt.subplot(1, 2, 1)
+for shield_group, group_df in combined.groupby('ShieldGroup'):
+    plt.plot(group_df['Frequency (MHz)'], group_df['SE (dB)'], marker='o', label=shield_group)
+plt.title("Shielding Effectiveness (SE) vs Frequency")
+plt.xlabel("Frequency (MHz)")
+plt.ylabel("SE (dB)")
+plt.legend(loc='best', fontsize=8)
+plt.grid(True)
+
+plt.subplot(1, 2, 2)
+for shield_group, group_df in combined.groupby('ShieldGroup'):
+    plt.plot(group_df['Frequency (MHz)'], group_df['Att (%)'], marker='o', label=shield_group)
+plt.title("Attenuation (%) vs Frequency")
+plt.xlabel("Frequency (MHz)")
+plt.ylabel("Attenuation (%)")
+plt.legend(loc='best', fontsize=8)
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# Zoomed-in plots (up to 30 MHz)
+zoom_max = 30
+
+plt.figure(figsize=(14,6))
+
+plt.subplot(1, 2, 1)
+for shield_group, group_df in combined.groupby('ShieldGroup'):
+    zoom_df = group_df[group_df['Frequency (MHz)'] <= zoom_max]
+    plt.plot(zoom_df['Frequency (MHz)'], zoom_df['SE (dB)'], marker='o', label=shield_group)
+plt.title("Zoomed-In SE (dB) (Up to 30 MHz)")
+plt.xlabel("Frequency (MHz)")
+plt.ylabel("SE (dB)")
+plt.legend(loc='best', fontsize=8)
+plt.grid(True)
+plt.xlim(0, zoom_max)
+
+plt.subplot(1, 2, 2)
+for shield_group, group_df in combined.groupby('ShieldGroup'):
+    zoom_df = group_df[group_df['Frequency (MHz)'] <= zoom_max]
+    plt.plot(zoom_df['Frequency (MHz)'], zoom_df['Att (%)'], marker='o', label=shield_group)
+plt.title("Zoomed-In Attenuation (%) (Up to 30 MHz)")
+plt.xlabel("Frequency (MHz)")
+plt.ylabel("Attenuation (%)")
+plt.legend(loc='best', fontsize=8)
+plt.grid(True)
+plt.xlim(0, zoom_max)
+
+plt.tight_layout()
+plt.show()
+
+# Zoomed-in plots (up to 1 MHz)
+zoom_max = 1
+
+plt.figure(figsize=(14,6))
+
+plt.subplot(1, 2, 1)
+for shield_group, group_df in combined.groupby('ShieldGroup'):
+    zoom_df = group_df[group_df['Frequency (MHz)'] <= zoom_max]
+    plt.plot(zoom_df['Frequency (MHz)'], zoom_df['SE (dB)'], marker='o', label=shield_group)
+plt.title("Zoomed-In SE (dB) (Up to 1 MHz)")
+plt.xlabel("Frequency (MHz)")
+plt.ylabel("SE (dB)")
+plt.legend(loc='best', fontsize=8)
+plt.grid(True)
+plt.xlim(0, zoom_max)
+
+plt.subplot(1, 2, 2)
+for shield_group, group_df in combined.groupby('ShieldGroup'):
+    zoom_df = group_df[group_df['Frequency (MHz)'] <= zoom_max]
+    plt.plot(zoom_df['Frequency (MHz)'], zoom_df['Att (%)'], marker='o', label=shield_group)
+plt.title("Zoomed-In Attenuation (%) (Up to 1 MHz)")
+plt.xlabel("Frequency (MHz)")
+plt.ylabel("Attenuation (%)")
+plt.legend(loc='best', fontsize=8)
+plt.grid(True)
+plt.xlim(0, zoom_max)
+
+plt.tight_layout()
+plt.show()
+
+# === NEW Zoomed-in plots (up to 0.1 MHz or 100 kHz) ===
+zoom_max = 0.1
+
+plt.figure(figsize=(14,6))
+
+plt.subplot(1, 2, 1)
+for shield_group, group_df in combined.groupby('ShieldGroup'):
+    zoom_df = group_df[group_df['Frequency (MHz)'] <= zoom_max]
+    plt.plot(zoom_df['Frequency (MHz)'], zoom_df['SE (dB)'], marker='o', label=shield_group)
+plt.title("Zoomed-In SE (dB) (Up to 100 kHz)")
+plt.xlabel("Frequency (MHz)")
+plt.ylabel("SE (dB)")
+plt.legend(loc='best', fontsize=8)
+plt.grid(True)
+plt.xlim(0, zoom_max)
+
+plt.subplot(1, 2, 2)
+for shield_group, group_df in combined.groupby('ShieldGroup'):
+    zoom_df = group_df[group_df['Frequency (MHz)'] <= zoom_max]
+    plt.plot(zoom_df['Frequency (MHz)'], zoom_df['Att (%)'], marker='o', label=shield_group)
+plt.title("Zoomed-In Attenuation (%) (Up to 100 kHz)")
+plt.xlabel("Frequency (MHz)")
+plt.ylabel("Attenuation (%)")
+plt.legend(loc='best', fontsize=8)
+plt.grid(True)
+plt.xlim(0, zoom_max)
+
+plt.tight_layout()
+plt.show()
+
+# === Export to Excel and download ===
+import time
+excel_filename = "combined_data.xlsx"
+combined.to_excel(excel_filename, index=False)
+time.sleep(1)
+files.download(excel_filename)
