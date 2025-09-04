@@ -1,0 +1,182 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from IPython.display import display, Image
+import re
+from pathlib import Path
+from google.colab import files
+
+def load_waveform(path, time_col="Time(s)", volt_col="Volt(V)"):
+    df = pd.read_csv(path, delimiter=',', skiprows=2)
+    df.columns = df.columns.str.strip()
+    df[time_col] = pd.to_numeric(df[time_col], errors='coerce')
+    df[volt_col] = pd.to_numeric(df[volt_col], errors='coerce')
+    df.dropna(subset=[time_col, volt_col], inplace=True)
+    df = df[df[volt_col] != 0]
+    return df[time_col].values, df[volt_col].values
+
+def compute_amplitude(voltage):
+    return np.max(voltage)
+
+def smooth_signal(signal, window_size=50):
+    return np.convolve(signal, np.ones(window_size)/window_size, mode='same')
+
+def parse_frequency_from_filename(filename):
+    pattern = re.compile(r'(\d*\.?\d+)\s*(GHz|MHz|kHz|Hz)', re.IGNORECASE)
+    match = pattern.search(filename)
+    if not match:
+        return None
+    value, unit = match.groups()
+    value = float(value)
+    unit = unit.lower()
+    if unit == 'ghz':
+        return int(value * 1e9)
+    elif unit == 'mhz':
+        return int(value * 1e6)
+    elif unit == 'khz':
+        return int(value * 1e3)
+    else:
+        return int(value)
+
+def format_freq(freq_hz):
+    if freq_hz is None:
+        return "Unknown"
+    if freq_hz >= 1e6:
+        return f"{freq_hz / 1e6:.3f}MHz"
+    elif freq_hz >= 1e3:
+        return f"{freq_hz / 1e3:.1f}kHz"
+    else:
+        return f"{freq_hz:.0f}Hz"
+
+def strip_frequency_from_name(name):
+    no_freq = re.sub(r'\d*\.?\d+\s*(GHz|MHz|kHz|Hz)', '', name, flags=re.IGNORECASE)
+    return re.sub(r'\s+', '', no_freq).lower().strip()
+
+def run_analysis(ref_files, shield_files, plot=False, csv_out=None):
+    ref_by_freq = {}
+    for f in ref_files:
+        freq = parse_frequency_from_filename(f)
+        if freq is None:
+            print(f"⚠️ Skipping reference file (no freq): {f}")
+            continue
+        t, v = load_waveform(f)
+        v = smooth_signal(v)
+        a = compute_amplitude(v)
+        ref_by_freq[freq] = (Path(f).stem, t, v, a)
+
+    if not ref_by_freq:
+        raise ValueError("❌ No valid unshielded files with frequency info found.")
+
+    results = []
+    grouped = {}
+
+    for f in shield_files:
+        freq = parse_frequency_from_filename(f)
+        if freq is None or freq not in ref_by_freq:
+            print(f"⚠️ Skipping shielded file (no matching unshielded freq): {f}")
+            continue
+
+        t_ref, v_ref = ref_by_freq[freq][1], ref_by_freq[freq][2]
+        a_ref = ref_by_freq[freq][3]
+
+        t, v = load_waveform(f)
+        v_smooth = smooth_signal(v)
+        a = compute_amplitude(v_smooth)
+        attn = 20 * np.log10(a_ref / a) if a != 0 else np.nan
+        attn = max(attn, 0)
+        attn_pct = max(0, 100 * (1 - a / a_ref)) if a_ref != 0 else np.nan
+
+        group_key = strip_frequency_from_name(Path(f).stem)
+
+        results.append({
+            "Filename": Path(f).name,
+            "Frequency (Hz)": freq,
+            "Frequency (readable)": format_freq(freq),
+            "Amplitude (V)": a,
+            "SE (dB)": round(attn, 3),
+            "Attenuation (%)": attn_pct,
+            "Group": group_key
+        })
+
+        print(f"🔵 {Path(f).name}: {a:.4f} V → Attenuation: {attn:.2f} dB / {attn_pct:.1f}% (Freq: {format_freq(freq)})")
+
+        grouped.setdefault(freq, []).append((group_key, Path(f).stem, t, v_smooth, attn, attn_pct, t_ref, v_ref))
+
+    summary_df = pd.DataFrame(results)
+
+    summary_df["Amplitude (V)"] = summary_df["Amplitude (V)"].round(3)
+    summary_df["Attenuation (%)"] = summary_df["Attenuation (%)"].round(3)
+
+    sorted_freqs = sorted(grouped.keys())
+
+    sorted_rows = []
+    for freq in sorted_freqs:
+        for item in grouped[freq]:
+            filename = item[1] + ".csv"
+            row = summary_df[summary_df['Filename'] == filename]
+            if not row.empty:
+                sorted_rows.append(row.iloc[0])
+
+    summary_df_sorted = pd.DataFrame(sorted_rows).reset_index(drop=True)
+
+    print("\n🔎 Summary Table:")
+    display(summary_df_sorted)
+
+    if csv_out:
+        summary_df_sorted.to_csv(csv_out, index=False)
+        print(f"\n✅ Results saved to {csv_out}")
+        files.download(csv_out)
+
+    print("\n📊 Attenuation Summary by Frequency:")
+    for freq in sorted_freqs:
+        group = grouped[freq]
+        attenuations = [x[4] for x in group]
+        atten_pcts = [x[5] for x in group]
+        print(f"{format_freq(freq)}: {len(group)} test(s) → "
+              f"Avg Attenuation = {np.nanmean(attenuations):.2f} dB / {np.nanmean(atten_pcts):.1f}%")
+
+    if plot:
+        for freq in sorted_freqs:
+            group = grouped[freq]
+            min_time = min(min(x[6][0], x[2][0]) for x in group)
+            max_time = max(max(x[6][-1], x[2][-1]) for x in group)
+            period = 1 / freq if freq != 0 else 0.002
+            zoom_window_sec = min(period * 3, max_time - min_time)
+
+            for label, _, _, _, _, _, t_ref, _ in group:
+                break  # grab first t_ref
+
+            for _, label, t, v, _, _, t_ref, v_ref in group:
+                mask = t >= min_time
+                plt.plot(t[mask], v[mask], label=label)
+            mask_ref = t_ref >= min_time
+            plt.plot(t_ref[mask_ref], v_ref[mask_ref], '--', label="Unshielded (ref)")
+
+            plt.title(f"Waveforms at {format_freq(freq)}")
+            plt.xlabel("Time (s)")
+            plt.ylabel("Voltage (V)")
+            plt.grid(True)
+            plt.legend()
+            plt.xlim(min_time, min_time + zoom_window_sec)
+
+            plt.tight_layout()
+            filename = f"plot_waveform_group_{format_freq(freq).replace('.', '_')}.png"
+            plt.savefig(filename)
+            display(Image(filename))
+            plt.clf()
+
+# === UPLOAD & RUN ===
+print("▶ Upload unshielded (reference) CSV file(s):")
+ref_upload = files.upload()
+ref_files = list(ref_upload.keys())
+
+print("\n▶ Upload shielded CSV file(s):")
+shield_upload = files.upload()
+shield_files = list(shield_upload.keys())
+
+run_analysis(
+    ref_files=ref_files,
+    shield_files=shield_files,
+    plot=True,
+    csv_out="Oscilloscope_Data.csv"
+)
